@@ -746,6 +746,7 @@
 
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 <div class="app">
@@ -774,6 +775,7 @@
         <button onclick="document.getElementById('importJSONInput').click()" style="background:transparent;border:1px solid var(--border-bright);color:var(--text-dim);border-radius:4px;padding:5px 12px;font-family:var(--mono);font-size:11px;cursor:pointer;letter-spacing:1px;transition:all 0.2s;" onmouseover="this.style.borderColor='var(--accent3)';this.style.color='var(--accent3)'" onmouseout="this.style.borderColor='var(--border-bright)';this.style.color='var(--text-dim)'">⬆ IMPORT</button>
         <input type="file" id="importJSONInput" accept=".json" style="display:none" onchange="importJSON(this)">
       </div>
+      <span id="syncIndicator" style="font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--accent);">⟳ CONNECTING</span>
       <div class="header-status">
         <div class="status-dot" id="statusDot"></div>
         <span id="statusText">NO KEY</span>
@@ -923,14 +925,136 @@
 </div>
 
 <script>
+  // ---- Supabase ----
+  const SUPABASE_URL = 'https://yyniqnfopjqwdonkpcqh.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl5bmlxbmZvcGpxd2RvbmtwY3FoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4ODM3MDMsImV4cCI6MjA5MDQ1OTcwM30.txw7RFU0D-ajeSWfYRHlpT0Hm0cGUE6erENUPE1O5wI';
+  const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
   // ---- State ----
   let datasets = [];
   let activeDatasetId = null;
   let searchAbortController = null;
   let searchRunning = false;
+  let syncStatus = 'idle'; // idle | syncing | error
 
   function getDataset() {
     return datasets.find(d => d.id === activeDatasetId);
+  }
+
+  // ---- Supabase Sync ----
+  async function loadFromSupabase() {
+    setSyncIndicator('syncing');
+    try {
+      const { data, error } = await sb.from('datasets').select('*').order('updated_at', { ascending: true });
+      if (error) throw error;
+      datasets = (data || []).map(row => ({
+        id: row.id,
+        name: row.name,
+        links: row.links || [],
+        poi: row.poi || '',
+        prompt: row.prompt || '',
+        promptDirty: row.prompt_dirty !== false,
+      }));
+      // Restore last active
+      const savedActive = localStorage.getItem('autothreat_active');
+      if (savedActive && datasets.find(d => d.id === savedActive)) {
+        activeDatasetId = savedActive;
+      } else if (datasets.length) {
+        activeDatasetId = datasets[0].id;
+      }
+      setSyncIndicator('ok');
+    } catch(e) {
+      setSyncIndicator('error', e.message);
+    }
+    renderSidebar();
+    renderEditor();
+  }
+
+  async function saveDataset(ds) {
+    if (!ds) return;
+    setSyncIndicator('syncing');
+    try {
+      const { error } = await sb.from('datasets').upsert({
+        id: ds.id,
+        name: ds.name,
+        links: ds.links,
+        poi: ds.poi,
+        prompt: ds.prompt,
+        prompt_dirty: ds.promptDirty,
+        updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      setSyncIndicator('ok');
+    } catch(e) {
+      setSyncIndicator('error', e.message);
+    }
+  }
+
+  async function deleteDatasetRemote(id) {
+    try {
+      await sb.from('datasets').delete().eq('id', id);
+    } catch(e) {
+      console.error('Delete error:', e);
+    }
+  }
+
+  // Subscribe to real-time changes
+  function subscribeRealtime() {
+    sb.channel('datasets-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'datasets' }, payload => {
+        handleRealtimeChange(payload);
+      })
+      .subscribe();
+  }
+
+  function handleRealtimeChange(payload) {
+    const { eventType, new: newRow, old: oldRow } = payload;
+    if (eventType === 'INSERT' || eventType === 'UPDATE') {
+      const ds = {
+        id: newRow.id,
+        name: newRow.name,
+        links: newRow.links || [],
+        poi: newRow.poi || '',
+        prompt: newRow.prompt || '',
+        promptDirty: newRow.prompt_dirty !== false,
+      };
+      const idx = datasets.findIndex(d => d.id === ds.id);
+      if (idx >= 0) {
+        // Don't overwrite if this is the active dataset being edited right now
+        // (our own save echoed back) - just update name for sidebar
+        if (ds.id === activeDatasetId) {
+          datasets[idx].name = ds.name;
+        } else {
+          datasets[idx] = ds;
+        }
+      } else {
+        datasets.push(ds);
+      }
+    } else if (eventType === 'DELETE') {
+      datasets = datasets.filter(d => d.id !== oldRow.id);
+      if (activeDatasetId === oldRow.id) {
+        activeDatasetId = datasets.length ? datasets[0].id : null;
+        renderEditor();
+      }
+    }
+    renderSidebar();
+    updateStats();
+  }
+
+  function setSyncIndicator(state, msg) {
+    const el = document.getElementById('syncIndicator');
+    if (!el) return;
+    if (state === 'syncing') {
+      el.textContent = '⟳ SYNCING';
+      el.style.color = 'var(--accent)';
+    } else if (state === 'ok') {
+      el.textContent = '✓ SYNCED';
+      el.style.color = 'var(--accent3)';
+    } else if (state === 'error') {
+      el.textContent = '✗ SYNC ERROR';
+      el.style.color = 'var(--accent2)';
+      el.title = msg || '';
+    }
   }
 
   // ---- Dataset CRUD ----
@@ -944,30 +1068,42 @@
       promptDirty: true,
     };
     datasets.push(ds);
-    saveToStorage();
+    saveDataset(ds);
     renderSidebar();
     selectDataset(ds.id);
   }
 
   function selectDataset(id) {
     activeDatasetId = id;
+    localStorage.setItem('autothreat_active', id);
     renderSidebar();
     renderEditor();
   }
 
   function renameCurrentDataset(name) {
     const ds = getDataset();
-    if (ds) { ds.name = name; renderSidebar(); saveToStorage(); }
+    if (!ds) return;
+    ds.name = name;
+    renderSidebar();
+    debounceSave(ds);
   }
 
   function deleteDataset(id) {
     datasets = datasets.filter(d => d.id !== id);
+    deleteDatasetRemote(id);
     if (activeDatasetId === id) {
       activeDatasetId = datasets.length ? datasets[0].id : null;
     }
-    saveToStorage();
     renderSidebar();
     renderEditor();
+  }
+
+  // Debounce saves for text fields
+  let saveTimers = {};
+  function debounceSave(ds, delay=800) {
+    if (!ds) return;
+    clearTimeout(saveTimers[ds.id]);
+    saveTimers[ds.id] = setTimeout(() => saveDataset(ds), delay);
   }
 
   // ---- Sidebar ----
@@ -1023,9 +1159,7 @@
       const ds = getDataset();
       if (ds && (ds.promptDirty || !ds.prompt)) generatePrompt();
     }
-    if (name === 'search') {
-      startSearch();
-    }
+    if (name === 'search') startSearch();
   }
 
   function switchTabById(name) {
@@ -1043,7 +1177,7 @@
     ds.links.push({ url: '', inDataset: false, foundVia: false, finding: false, comments: '' });
     renderLinks();
     updateStats();
-    saveToStorage();
+    debounceSave(ds);
   }
 
   function removeLink(idx) {
@@ -1051,7 +1185,7 @@
     ds.links.splice(idx, 1);
     renderLinks();
     updateStats();
-    saveToStorage();
+    saveDataset(ds);
   }
 
   function renderLinks() {
@@ -1081,8 +1215,12 @@
     const ds = getDataset();
     if (!ds) return;
     ds.links[idx][field] = value;
-    if (field !== 'url' && field !== 'comments') updateStats();
-    saveToStorage();
+    if (field !== 'url' && field !== 'comments') {
+      updateStats();
+      saveDataset(ds);
+    } else {
+      debounceSave(ds);
+    }
   }
 
   function updateStats() {
@@ -1103,12 +1241,10 @@
   function onPoiChange() {
     const ds = getDataset();
     if (!ds) return;
-    const val = document.getElementById('poiTextarea').value;
-    ds.poi = val;
+    ds.poi = document.getElementById('poiTextarea').value;
     ds.promptDirty = true;
-    saveToStorage();
-    const notice = document.getElementById('poiNotice');
-    notice.classList.toggle('show', !!val.trim());
+    debounceSave(ds);
+    document.getElementById('poiNotice').classList.toggle('show', !!ds.poi.trim());
   }
 
   // ---- Prompt Generation ----
@@ -1124,7 +1260,6 @@
       document.getElementById('promptBox').textContent = 'No API key set. Enter your Anthropic API key in the top-right field.';
       return;
     }
-
     const links = ds.links.filter(l => l.url.trim()).map(l => l.url.trim());
     const linksSample = links.slice(0, 20).join('\n');
     const genEl = document.getElementById('promptGenerating');
@@ -1177,7 +1312,7 @@ Generate a threat intelligence search prompt for this dataset.`;
       ds.prompt = text;
       ds.promptDirty = false;
       promptBox.textContent = text;
-      saveToStorage();
+      saveDataset(ds);
       document.getElementById('poiNotice').classList.remove('show');
     } catch (e) {
       promptBox.textContent = 'Error: ' + e.message;
@@ -1211,22 +1346,16 @@ Generate a threat intelligence search prompt for this dataset.`;
     if (searchRunning) return;
     const ds = getDataset();
     if (!ds) { alert('Select a dataset first.'); return; }
-
     const apiKey = localStorage.getItem('threatlens_apikey') || '';
     if (!apiKey) { alert('No API key set. Enter your Anthropic API key in the header.'); return; }
-
     if (!ds.prompt && !ds.poi) {
       alert('No prompt or Points of Interest defined. Please fill in the POI tab and generate a prompt first.');
       return;
     }
-
     const refLinks = ds.links.filter(l => l.inDataset && l.url.trim()).map(l => l.url.trim());
-
-    // Setup UI
     const searchTab = document.getElementById('searchTab');
     searchTab.classList.add('searching');
     searchRunning = true;
-
     const summary = document.getElementById('searchSummary');
     const log = document.getElementById('searchLog');
     summary.style.display = 'flex';
@@ -1234,11 +1363,7 @@ Generate a threat intelligence search prompt for this dataset.`;
     log.innerHTML = '';
     document.getElementById('searchFoundCount').textContent = '0';
     setSearchStatus('Initializing search...', 'running');
-
-    const timeoutId = setTimeout(() => {
-      if (searchAbortController) searchAbortController.abort();
-    }, 10 * 60 * 1000); // 10 min hard limit
-
+    const timeoutId = setTimeout(() => { if (searchAbortController) searchAbortController.abort(); }, 10 * 60 * 1000);
     searchAbortController = new AbortController();
     let totalFound = 0;
 
@@ -1267,20 +1392,12 @@ CRITICAL RULES:
 ${ds.prompt || ds.poi}
 
 REFERENCE LINKS (confirmed in dataset, use these to identify patterns):
-${refLinks.length > 0 ? refLinks.map((u, i) => (i+1) + '. ' + u).join('\n') : '(none checked yet — use the prompt context only)'}
+${refLinks.length > 0 ? refLinks.map((u, i) => (i+1) + '. ' + u).join('\n') : '(none checked yet)'}
 
 ALREADY KNOWN URLS (do NOT include these):
 ${existingUrls.slice(0, 50).join('\n') || '(none)'}
 
-TASK: Based on the threat intelligence prompt and reference links above, identify additional suspicious or malicious URLs/domains that fit the same threat cluster. Look for:
-- Similar domain naming patterns or typosquats
-- Same hosting infrastructure or ASN
-- Related phishing/malware delivery URLs
-- Lookalike domains targeting the same brands or sectors
-- C2 endpoints matching the profile
-- URLs sharing registrar, IP range, or cert patterns with the reference links
-
-Return raw JSON only.`;
+TASK: Identify additional suspicious or malicious URLs/domains that fit the same threat cluster. Return raw JSON only.`;
 
       appendLog('<span class="log-info">→ Sending intelligence context to analysis engine...</span>');
       setSearchStatus('Analyzing threat patterns...', 'running');
@@ -1303,41 +1420,27 @@ Return raw JSON only.`;
       });
 
       const data = await response.json();
-      if (!response.ok) {
-        throw new Error('API Error ' + response.status + ': ' + (data.error && data.error.message ? data.error.message : JSON.stringify(data)));
-      }
+      if (!response.ok) throw new Error('API Error ' + response.status + ': ' + (data.error && data.error.message ? data.error.message : JSON.stringify(data)));
 
       const rawText = data.content && data.content.map(b => b.text || '').join('') || '';
-
-      // Parse JSON response
       let parsed;
       try {
-        const cleaned = rawText.replace(/```json|```/g, '').trim();
-        parsed = JSON.parse(cleaned);
+        parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
       } catch(e) {
-        // Try to extract JSON object from text
         const match = rawText.match(/\{[\s\S]*\}/);
-        if (match) {
-          try { parsed = JSON.parse(match[0]); }
-          catch(e2) { throw new Error('Could not parse model response as JSON. Raw: ' + rawText.slice(0, 200)); }
-        } else {
-          throw new Error('No JSON found in model response. Raw: ' + rawText.slice(0, 200));
-        }
+        if (match) { try { parsed = JSON.parse(match[0]); } catch(e2) { throw new Error('Could not parse response: ' + rawText.slice(0, 200)); } }
+        else throw new Error('No JSON in response: ' + rawText.slice(0, 200));
       }
 
       const urls = parsed.urls || [];
       const reasoning = parsed.reasoning || '';
-
       if (reasoning) {
-        appendLog('');
         appendLog('<span class="log-head">// DETECTION METHODOLOGY</span>');
         appendLog('<span class="log-info">' + escHtml(reasoning) + '</span>');
         appendLog('');
       }
-
       appendLog('<span class="log-head">// CANDIDATE URLS</span>');
 
-      // Filter out already-known URLs and add new ones
       let addedThisRound = 0;
       for (const url of urls) {
         const normalized = url.trim().toLowerCase();
@@ -1346,88 +1449,56 @@ Return raw JSON only.`;
           appendLog('<span class="log-warn">  SKIP (known)  ' + escHtml(url) + '</span>');
           continue;
         }
-        // Add to dataset with foundVia checked
-        ds.links.push({
-          url: url.trim(),
-          inDataset: false,
-          foundVia: true,
-          finding: false,
-          comments: 'Found via dataset search'
-        });
+        ds.links.push({ url: url.trim(), inDataset: false, foundVia: true, finding: false, comments: 'Found via dataset search' });
         existingSet.add(normalized);
         addedThisRound++;
         totalFound++;
         document.getElementById('searchFoundCount').textContent = totalFound;
         appendLog('<span class="log-found">  + ADDED       ' + escHtml(url) + '</span>');
       }
-
       appendLog('');
       appendLog('<span class="log-info">Round complete. Added ' + addedThisRound + ' new link(s).</span>');
 
-      // Do a second pass for deeper expansion if first pass found something
+      // Pass 2
       if (addedThisRound > 0 && refLinks.length > 0) {
         appendLog('');
         appendLog('<span class="log-head">// SECOND PASS — EXPANDING FROM NEW FINDINGS</span>');
         setSearchStatus('Running second-pass expansion...', 'running');
-
-        const newlyFound = ds.links.filter(l => l.foundVia && l.url.trim()).slice(-addedThisRound).map(l => l.url.trim());
+        const newlyFound = ds.links.filter(l => l.foundVia).slice(-addedThisRound).map(l => l.url.trim());
         const pass2Msg = `THREAT INTELLIGENCE CONTEXT:
 ${ds.prompt || ds.poi}
 
 ORIGINAL REFERENCE LINKS:
 ${refLinks.map((u, i) => (i+1) + '. ' + u).join('\n')}
 
-NEW LINKS JUST DISCOVERED (use these for further expansion):
+NEW LINKS JUST DISCOVERED:
 ${newlyFound.map((u, i) => (i+1) + '. ' + u).join('\n')}
 
 ALREADY KNOWN URLS (do NOT include):
 ${[...existingSet].slice(0, 60).join('\n')}
 
-TASK: Based on the newly discovered URLs above and the original reference links, identify additional related infrastructure. Look for patterns in the new findings that suggest further related domains or URLs. Return raw JSON only.`;
+TASK: Identify additional related infrastructure from the newly discovered links. Return raw JSON only.`;
 
         const resp2 = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           signal: searchAbortController.signal,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true'
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 2000,
-            system: systemPrompt,
-            messages: [{ role: 'user', content: pass2Msg }]
-          })
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 2000, system: systemPrompt, messages: [{ role: 'user', content: pass2Msg }] })
         });
-
         const data2 = await resp2.json();
         if (resp2.ok) {
           const raw2 = data2.content && data2.content.map(b => b.text || '').join('') || '';
           let parsed2;
-          try {
-            const cleaned2 = raw2.replace(/```json|```/g, '').trim();
-            parsed2 = JSON.parse(cleaned2);
-          } catch(e) {
-            const m = raw2.match(/\{[\s\S]*\}/);
-            if (m) { try { parsed2 = JSON.parse(m[0]); } catch(e2) { parsed2 = null; } }
-          }
+          try { parsed2 = JSON.parse(raw2.replace(/```json|```/g, '').trim()); }
+          catch(e) { const m = raw2.match(/\{[\s\S]*\}/); if (m) { try { parsed2 = JSON.parse(m[0]); } catch(e2) {} } }
           if (parsed2 && parsed2.urls) {
             let added2 = 0;
             for (const url of parsed2.urls) {
               const normalized = url.trim().toLowerCase();
               if (!normalized || existingSet.has(normalized)) continue;
-              ds.links.push({
-                url: url.trim(),
-                inDataset: false,
-                foundVia: true,
-                finding: false,
-                comments: 'Found via dataset search (pass 2)'
-              });
+              ds.links.push({ url: url.trim(), inDataset: false, foundVia: true, finding: false, comments: 'Found via dataset search (pass 2)' });
               existingSet.add(normalized);
-              added2++;
-              totalFound++;
+              added2++; totalFound++;
               document.getElementById('searchFoundCount').textContent = totalFound;
               appendLog('<span class="log-found">  + ADDED       ' + escHtml(url) + '</span>');
             }
@@ -1437,11 +1508,9 @@ TASK: Based on the newly discovered URLs above and the original reference links,
         }
       }
 
-      // Save and re-render links
-      saveToStorage();
+      await saveDataset(ds);
       renderLinks();
       updateStats();
-
       appendLog('');
       appendLog('<span class="log-head">// SEARCH COMPLETE</span>');
       appendLog('<span class="log-found">Total new links added: ' + totalFound + '</span>');
@@ -1449,15 +1518,13 @@ TASK: Based on the newly discovered URLs above and the original reference links,
 
     } catch(e) {
       if (e.name === 'AbortError') {
-        appendLog('');
         appendLog('<span class="log-warn">// SEARCH ABORTED (10 minute limit reached)</span>');
         setSearchStatus('Timed out after 10 minutes', 'error');
       } else {
-        appendLog('');
         appendLog('<span class="log-err">// ERROR: ' + escHtml(e.message) + '</span>');
-        setSearchStatus('Error: ' + e.message.slice(0, 60), 'error');
+        setSearchStatus('Error: ' + e.message.slice(0, 80), 'error');
       }
-      saveToStorage();
+      await saveDataset(ds);
       renderLinks();
       updateStats();
     } finally {
@@ -1474,25 +1541,18 @@ TASK: Based on the newly discovered URLs above and the original reference links,
 
   function showImportError(msg) {
     const el = document.getElementById('importError');
-    const ok = document.getElementById('importSuccess');
-    el.textContent = '⚠ ' + msg;
-    el.classList.add('show');
-    ok.classList.remove('show');
+    el.textContent = '⚠ ' + msg; el.classList.add('show');
+    document.getElementById('importSuccess').classList.remove('show');
   }
 
   function showImportSuccess(msg) {
     const el = document.getElementById('importSuccess');
-    const err = document.getElementById('importError');
-    el.textContent = '✓ ' + msg;
-    el.classList.add('show');
-    err.classList.remove('show');
+    el.textContent = '✓ ' + msg; el.classList.add('show');
+    document.getElementById('importError').classList.remove('show');
     setTimeout(() => el.classList.remove('show'), 4000);
   }
 
-  function normalizeHeader(h) {
-    return String(h).toLowerCase().replace(/[^a-z]/g, '');
-  }
-
+  function normalizeHeader(h) { return String(h).toLowerCase().replace(/[^a-z]/g, ''); }
   function parseBool(val) {
     if (typeof val === 'boolean') return val;
     const s = String(val).toLowerCase().trim();
@@ -1500,22 +1560,13 @@ TASK: Based on the newly discovered URLs above and the original reference links,
   }
 
   function processRows(rows) {
-    if (!rows || rows.length < 2) {
-      showImportError('File must have a header row and at least one data row.');
-      return;
-    }
+    if (!rows || rows.length < 2) { showImportError('File must have a header row and at least one data row.'); return; }
     const headers = rows[0].map(normalizeHeader);
     for (const req of REQUIRED_COLS) {
-      if (!headers.includes(req)) {
-        showImportError('Missing required column: "' + req + '". Expected columns: Number, URL, In Dataset?, Found via Dataset?, Finding?, Comments');
-        return;
-      }
+      if (!headers.includes(req)) { showImportError('Missing required column: "' + req + '". Expected: Number, URL, In Dataset?, Found via Dataset?, Finding?, Comments'); return; }
     }
     const unexpected = headers.filter(h => h && !ALL_EXPECTED.includes(h));
-    if (unexpected.length) {
-      showImportError('Unrecognized column(s): ' + unexpected.join(', ') + '. Expected: Number, URL, In Dataset?, Found via Dataset?, Finding?, Comments');
-      return;
-    }
+    if (unexpected.length) { showImportError('Unrecognized column(s): ' + unexpected.join(', ')); return; }
     const ds = getDataset();
     if (!ds) return;
     let added = 0;
@@ -1525,18 +1576,10 @@ TASK: Based on the newly discovered URLs above and the original reference links,
       const get = col => { const idx = headers.indexOf(col); return idx >= 0 ? row[idx] : undefined; };
       const url = String(get('url') || '').trim();
       if (!url) continue;
-      ds.links.push({
-        url,
-        inDataset: parseBool(get('indataset')),
-        foundVia: parseBool(get('foundviadataset')),
-        finding: parseBool(get('finding')),
-        comments: String(get('comments') || '').trim(),
-      });
+      ds.links.push({ url, inDataset: parseBool(get('indataset')), foundVia: parseBool(get('foundviadataset')), finding: parseBool(get('finding')), comments: String(get('comments') || '').trim() });
       added++;
     }
-    renderLinks();
-    updateStats();
-    saveToStorage();
+    renderLinks(); updateStats(); saveDataset(ds);
     showImportSuccess('Imported ' + added + ' link' + (added !== 1 ? 's' : '') + ' successfully.');
   }
 
@@ -1548,18 +1591,13 @@ TASK: Based on the newly discovered URLs above and the original reference links,
     if (ext === 'csv') {
       const reader = new FileReader();
       reader.onload = e => {
-        const text = e.target.result;
-        const rows = text.trim().split(/\r?\n/).map(line => {
-          const result = [];
-          let cur = '', inQ = false;
+        const rows = e.target.result.trim().split(/\r?\n/).map(line => {
+          const result = []; let cur = '', inQ = false;
           for (let i = 0; i < line.length; i++) {
             const c = line[i];
-            if (c === '"') { inQ = !inQ; }
-            else if (c === ',' && !inQ) { result.push(cur); cur = ''; }
-            else { cur += c; }
+            if (c === '"') { inQ = !inQ; } else if (c === ',' && !inQ) { result.push(cur); cur = ''; } else { cur += c; }
           }
-          result.push(cur);
-          return result;
+          result.push(cur); return result;
         });
         processRows(rows);
       };
@@ -1570,11 +1608,8 @@ TASK: Based on the newly discovered URLs above and the original reference links,
         try {
           const wb = XLSX.read(e.target.result, { type: 'array' });
           const ws = wb.Sheets[wb.SheetNames[0]];
-          const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-          processRows(rows);
-        } catch(err) {
-          showImportError('Could not read Excel file: ' + err.message);
-        }
+          processRows(XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }));
+        } catch(err) { showImportError('Could not read Excel file: ' + err.message); }
       };
       reader.readAsArrayBuffer(file);
     } else {
@@ -1588,9 +1623,8 @@ TASK: Based on the newly discovered URLs above and the original reference links,
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const date = new Date().toISOString().slice(0, 10);
     a.href = url;
-    a.download = 'autothreat_backup_' + date + '.json';
+    a.download = 'autothreat_backup_' + new Date().toISOString().slice(0, 10) + '.json';
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -1605,23 +1639,14 @@ TASK: Based on the newly discovered URLs above and the original reference links,
     reader.onload = e => {
       try {
         const data = JSON.parse(e.target.result);
-        if (!data.datasets || !Array.isArray(data.datasets)) {
-          alert('Invalid backup file: missing datasets array.');
-          return;
-        }
+        if (!data.datasets || !Array.isArray(data.datasets)) { alert('Invalid backup file.'); return; }
         for (const ds of data.datasets) {
-          if (!ds.id || !ds.name || !Array.isArray(ds.links)) {
-            alert('Invalid backup file: one or more datasets are malformed.');
-            return;
-          }
+          if (!ds.id || !ds.name || !Array.isArray(ds.links)) { alert('Malformed backup file.'); return; }
         }
         pendingImportData = data.datasets;
-        document.getElementById('importJSONPreview').textContent =
-          'Found ' + data.datasets.length + ' dataset(s): ' + data.datasets.map(d => d.name).join(', ');
+        document.getElementById('importJSONPreview').textContent = 'Found ' + data.datasets.length + ' dataset(s): ' + data.datasets.map(d => d.name).join(', ');
         document.getElementById('importJSONModal').classList.add('show');
-      } catch(err) {
-        alert('Could not parse file: ' + err.message);
-      }
+      } catch(err) { alert('Could not parse file: ' + err.message); }
     };
     reader.readAsText(file);
   }
@@ -1631,10 +1656,12 @@ TASK: Based on the newly discovered URLs above and the original reference links,
     pendingImportData = null;
   }
 
-  function confirmImportJSON() {
+  async function confirmImportJSON() {
     if (!pendingImportData) return;
     const mode = document.querySelector('input[name="importMode"]:checked').value;
     if (mode === 'replace') {
+      // Delete all existing in Supabase then re-insert
+      for (const ds of datasets) await deleteDatasetRemote(ds.id);
       datasets = pendingImportData;
       activeDatasetId = datasets.length ? datasets[0].id : null;
     } else {
@@ -1643,7 +1670,7 @@ TASK: Based on the newly discovered URLs above and the original reference links,
       datasets = [...datasets, ...toAdd];
       if (!activeDatasetId && datasets.length) activeDatasetId = datasets[0].id;
     }
-    saveToStorage();
+    for (const ds of datasets) await saveDataset(ds);
     renderSidebar();
     renderEditor();
     closeImportJSONModal();
@@ -1667,33 +1694,12 @@ TASK: Based on the newly discovered URLs above and the original reference links,
     const dot = document.getElementById('statusDot');
     const txt = document.getElementById('statusText');
     if (key && key.startsWith('sk-ant-')) {
-      dot.style.background = 'var(--accent3)';
-      txt.textContent = 'KEY SET';
+      dot.style.background = 'var(--accent3)'; txt.textContent = 'KEY SET';
     } else if (key) {
-      dot.style.background = '#ff9900';
-      txt.textContent = 'KEY INVALID';
+      dot.style.background = '#ff9900'; txt.textContent = 'KEY INVALID';
     } else {
-      dot.style.background = 'var(--accent2)';
-      txt.textContent = 'NO KEY';
+      dot.style.background = 'var(--accent2)'; txt.textContent = 'NO KEY';
     }
-  }
-
-  // ---- Storage ----
-  function saveToStorage() {
-    try {
-      localStorage.setItem('threatlens_datasets', JSON.stringify(datasets));
-      localStorage.setItem('threatlens_active', activeDatasetId || '');
-    } catch(e) {}
-  }
-
-  function loadFromStorage() {
-    try {
-      const raw = localStorage.getItem('threatlens_datasets');
-      if (raw) datasets = JSON.parse(raw);
-      const active = localStorage.getItem('threatlens_active');
-      if (active && datasets.find(d => d.id === active)) activeDatasetId = active;
-      else if (datasets.length) activeDatasetId = datasets[0].id;
-    } catch(e) {}
   }
 
   // ---- Utils ----
@@ -1701,25 +1707,18 @@ TASK: Based on the newly discovered URLs above and the original reference links,
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  // Modal overlay close handlers
-  document.getElementById('newDatasetModal').addEventListener('click', function(e) {
-    if (e.target === this) closeNewDatasetModal();
-  });
-  document.getElementById('importJSONModal').addEventListener('click', function(e) {
-    if (e.target === this) closeImportJSONModal();
-  });
+  document.getElementById('newDatasetModal').addEventListener('click', function(e) { if (e.target === this) closeNewDatasetModal(); });
+  document.getElementById('importJSONModal').addEventListener('click', function(e) { if (e.target === this) closeImportJSONModal(); });
 
   // ---- Modal ----
   function openNewDatasetModal() {
     document.getElementById('newDatasetModal').classList.add('show');
     setTimeout(() => document.getElementById('newDatasetName').focus(), 50);
   }
-
   function closeNewDatasetModal() {
     document.getElementById('newDatasetModal').classList.remove('show');
     document.getElementById('newDatasetName').value = '';
   }
-
   function confirmNewDataset() {
     const name = document.getElementById('newDatasetName').value.trim();
     if (!name) return;
@@ -1728,10 +1727,8 @@ TASK: Based on the newly discovered URLs above and the original reference links,
   }
 
   // ---- Init ----
-  loadFromStorage();
   loadApiKey();
-  renderSidebar();
-  renderEditor();
+  loadFromSupabase().then(() => subscribeRealtime());
 </script>
 </body>
 </html>
